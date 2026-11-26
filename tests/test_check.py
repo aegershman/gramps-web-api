@@ -416,6 +416,14 @@ class TestStripBrokenNoteLinks(unittest.TestCase):
 
         self.assertEqual(self._link_values(note), [good])
 
+    def test_every_link_to_a_missing_object_is_removed(self):
+        broken = "gramps://Note/handle/nosuchhandle"
+        note = self._add_note([broken, broken])
+
+        self.assertEqual(self._strip(), [("note", note.gramps_id)])
+
+        self.assertEqual(self._link_values(note), [])
+
     def test_only_repaired_notes_are_committed(self):
         note = self._add_note(["gramps://Place/handle/nosuchhandle"])
 

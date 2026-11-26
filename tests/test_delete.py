@@ -198,3 +198,55 @@ def test_delete_note_that_links_to_itself(db):
     _delete(db, "Note", handle)
 
     assert not db.has_note_handle(handle)
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [[[(0, 5)], [(10, 16)]], [[(0, 5), (10, 16)]]],
+    ids=["two tags", "one tag with two ranges"],
+)
+def test_delete_removes_every_link_of_a_note_to_the_object(db, ranges):
+    target = _add(db, Event())
+    value = f"gramps://Event/handle/{target}"
+    note = Note()
+    note.set_styledtext(
+        StyledText(
+            "First and second.",
+            [StyledTextTag(StyledTextTagType.LINK, value, spans) for spans in ranges],
+        )
+    )
+    note_handle = _add(db, note)
+    # the note is one referent of the object, however often it links to it
+    assert list(db.find_backlink_handles(target)) == [("Note", note_handle)]
+
+    _delete(db, "Event", target)
+
+    note = db.get_note_from_handle(note_handle)
+    assert str(note.text) == "First and second."
+    assert note.text.get_tags() == []
+    assert list(db.find_backlink_handles(target)) == []
+
+
+def test_delete_leaves_links_by_gramps_id(db):
+    # A link by Gramps ID is no reference in Gramps, so the note is not among
+    # the object's backlinks for it. Delete leaves that link, as Gramps
+    # desktop does, and check and repair removes it.
+    event = Event()
+    target = _add(db, event)
+    by_id = f"gramps://Event/gramps_id/{event.gramps_id}"
+    note = Note()
+    note.set_styledtext(
+        StyledText(
+            "First and second.",
+            [
+                _link("Event", target, 0, 5),
+                StyledTextTag(StyledTextTagType.LINK, by_id, [(10, 16)]),
+            ],
+        )
+    )
+    note_handle = _add(db, note)
+
+    _delete(db, "Event", target)
+
+    tags = db.get_note_from_handle(note_handle).text.get_tags()
+    assert [tag.value for tag in tags] == [by_id]
