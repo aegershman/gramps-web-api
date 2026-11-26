@@ -20,6 +20,7 @@
 """Unit tests for `gramps_webapi.api.check`."""
 
 import unittest
+from unittest.mock import patch
 
 from gramps.gen.db import DbTxn
 from gramps.gen.lib import (
@@ -29,15 +30,20 @@ from gramps.gen.lib import (
     EventRef,
     EventType,
     MediaRef,
+    Note,
     Person,
     Place,
     PlaceName,
     PlaceType,
+    StyledText,
+    StyledTextTag,
+    StyledTextTagType,
 )
 
 from gramps_webapi.api.check import (
     check_database,
     rebuild_custom_type_caches,
+    strip_broken_note_links,
     strip_empty_refs,
     strip_unknown_keys,
 )
@@ -329,3 +335,103 @@ class TestStripUnknownKeys(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStripBrokenNoteLinks(unittest.TestCase):
+    """Tests for removing links in note text to objects that do not exist."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.exampledb = ExampleDbInMemory()
+        cls.db = cls.exampledb.load()
+        # whatever the example tree itself holds is not what is tested here
+        with DbTxn("strip", cls.db) as trans:
+            strip_broken_note_links(cls.db, trans)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+        cls.exampledb.close()
+
+    def _add_note(self, links):
+        """Add a note with bold text and the given links; return it."""
+        tags = [StyledTextTag(StyledTextTagType.BOLD, True, [(0, 3)])]
+        tags += [
+            StyledTextTag(StyledTextTagType.LINK, value, [(4 + i, 5 + i)])
+            for i, value in enumerate(links)
+        ]
+        note = Note()
+        note.set_styledtext(StyledText("See these records.", tags))
+        with DbTxn("add note", self.db) as trans:
+            self.db.add_note(note, trans)
+        return note
+
+    def _strip(self):
+        with DbTxn("strip", self.db) as trans:
+            return strip_broken_note_links(self.db, trans)
+
+    def _link_values(self, note):
+        tags = self.db.get_note_from_handle(note.handle).text.get_tags()
+        return [tag.value for tag in tags if tag.name == StyledTextTagType.LINK]
+
+    def test_link_to_missing_handle_removed(self):
+        note = self._add_note(["gramps://Person/handle/nosuchhandle"])
+
+        self.assertEqual(self._strip(), [("note", note.gramps_id)])
+
+        stored = self.db.get_note_from_handle(note.handle)
+        self.assertEqual(str(stored.text), "See these records.")
+        self.assertEqual(
+            [int(tag.name) for tag in stored.text.get_tags()],
+            [StyledTextTagType.BOLD],
+        )
+
+    def test_link_to_missing_gramps_id_removed(self):
+        note = self._add_note(["gramps://Event/gramps_id/E999999"])
+
+        self.assertEqual(self._strip(), [("note", note.gramps_id)])
+
+        self.assertEqual(self._link_values(note), [])
+
+    def test_valid_and_foreign_links_kept(self):
+        person = self.db.get_person_from_handle(self.db.get_person_handles()[0])
+        links = [
+            f"gramps://Person/handle/{person.handle}",
+            f"gramps://Person/gramps_id/{person.gramps_id}",
+            "https://example.org/",
+            "gramps://not/a/link/to/an/object",
+        ]
+        note = self._add_note(links)
+
+        self.assertEqual(self._strip(), [])
+
+        self.assertEqual(self._link_values(note), links)
+
+    def test_only_the_broken_link_is_removed(self):
+        person = self.db.get_person_from_handle(self.db.get_person_handles()[0])
+        good = f"gramps://Person/handle/{person.handle}"
+        note = self._add_note([good, "gramps://Note/handle/nosuchhandle"])
+
+        self._strip()
+
+        self.assertEqual(self._link_values(note), [good])
+
+    def test_only_repaired_notes_are_committed(self):
+        note = self._add_note(["gramps://Place/handle/nosuchhandle"])
+
+        with patch.object(
+            self.db, "commit_note", wraps=self.db.commit_note
+        ) as commit_note:
+            repaired = self._strip()
+
+        self.assertEqual(repaired, [("note", note.gramps_id)])
+        self.assertEqual(commit_note.call_count, 1)
+
+    def test_check_database_reports_and_repairs(self):
+        note = self._add_note(["gramps://Source/handle/nosuchhandle"])
+
+        result = check_database(self.db)
+
+        self.assertGreaterEqual(result["num_errors"], 1)
+        self.assertIn("links to objects that do not exist", result["message"])
+        self.assertEqual(self._link_values(note), [])

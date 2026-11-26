@@ -28,7 +28,7 @@ from typing import Callable, Optional
 
 from gramps.gen.db import DbTxn, DbWriteBase
 from gramps.gen.dbstate import DbState
-from gramps.gen.lib import Person
+from gramps.gen.lib import Note, Person, StyledTextTagType
 
 from ..const import GRAMPS_OBJECT_PLURAL
 from .resources.util import _class_keys
@@ -206,6 +206,53 @@ def strip_empty_refs(db_handle: DbWriteBase, trans: DbTxn) -> list[tuple[str, st
     return repaired
 
 
+# A link in the text of a note to an object that is not in the tree, left
+# for example by a delete before deleting removed such links. Gramps' own
+# `CheckIntegrity.check_note_links()` removes them as well, but it commits
+# every note of the tree, whether or not it had such a link, so each run
+# would give every note a new change time.
+NOTE_LINK_PREFIX = "gramps://"
+
+
+def _strip_broken_links_from_note(db_handle: DbWriteBase, note: Note) -> int:
+    """Drop the links of one note whose target does not exist.
+
+    Only the link is removed, the linked words stay. Returns the number of
+    links removed.
+    """
+    kept = []
+    removed = 0
+    for tag in note.text.get_tags():
+        if tag.name == StyledTextTagType.LINK and tag.value.startswith(
+            NOTE_LINK_PREFIX
+        ):
+            parts = tag.value[len(NOTE_LINK_PREFIX) :].split("/")
+            if len(parts) == 3 and parts[1] in ("handle", "gramps_id"):
+                has_object = db_handle.method(f"has_%s_{parts[1]}", parts[0])
+                if has_object is not None and not has_object(parts[2]):
+                    removed += 1
+                    continue
+        kept.append(tag)
+    if removed:
+        note.text.set_tags(kept)
+    return removed
+
+
+def strip_broken_note_links(
+    db_handle: DbWriteBase, trans: DbTxn
+) -> list[tuple[str, str]]:
+    """Remove links to objects that do not exist from the text of all notes.
+
+    Returns the list of (object type, Gramps ID) pairs that were repaired.
+    """
+    repaired: list[tuple[str, str]] = []
+    for note in db_handle.iter_notes():
+        if _strip_broken_links_from_note(db_handle, note):
+            db_handle.commit_note(note, trans)
+            repaired.append(("note", note.gramps_id))
+    return repaired
+
+
 # Objects committed before unknown keys were rejected on write (#1004) can carry
 # stray attributes, e.g. `type` on a Place from a frontend bug. The API returns
 # them on read, so a client echoing the object back gets a 400 on save, and
@@ -265,7 +312,7 @@ def check_database(db_handle: DbWriteBase, progress_cb: Optional[Callable] = Non
     i = 0
 
     def progress(i):
-        total = 23
+        total = 24
         if progress_cb:
             progress_cb(current=i, total=total)
         i += 1
@@ -356,7 +403,10 @@ def check_database(db_handle: DbWriteBase, progress_cb: Optional[Callable] = Non
 
         i = progress(i)
         checker.check_media_sourceref()
-        # checker.check_note_links()  # requires Gramps 5.2
+
+        i = progress(i)
+        # not checker.check_note_links() - see NOTE_LINK_PREFIX
+        stripped_links = strip_broken_note_links(db_handle, trans)
 
         i = progress(i)
         checker.check_backlinks()
@@ -379,6 +429,7 @@ def check_database(db_handle: DbWriteBase, progress_cb: Optional[Callable] = Non
         + len(removed_custom_types)
         + len(stripped_refs)
         + len(stripped_keys)
+        + len(stripped_links)
     )
     text = checker.text.getvalue()
     if stripped_keys:
@@ -390,6 +441,11 @@ def check_database(db_handle: DbWriteBase, progress_cb: Optional[Callable] = Non
         text += (
             f"{len(stripped_refs)} object(s) had references without a target, "
             "which were removed\n"
+        )
+    if stripped_links:
+        text += (
+            f"{len(stripped_links)} note(s) had links to objects that do not "
+            "exist, which were removed\n"
         )
     if removed_custom_types:
         text += (

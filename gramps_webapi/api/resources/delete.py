@@ -43,6 +43,29 @@ from ..search import get_search_indexer
 from .util import transaction_to_json
 
 
+def _remove_note_links(
+    db_handle: DbWriteBase, class_name: str, handle: str, trans: DbTxn
+) -> None:
+    """Remove the links to an object from the text of the notes linking to it.
+
+    A link in the text of a note is a reference to its target since
+    Gramps 5.2, but notes are not among the referents the `get_*_referents`
+    helpers return. Only the link is removed, the linked words stay, as in
+    Gramps desktop.
+    """
+    backlinks = list(db_handle.find_backlink_handles(handle, ["Note"]))
+    for _, note_handle in backlinks:
+        if note_handle == handle:
+            # a note linking to itself: it is the one being deleted
+            continue
+        try:
+            note = db_handle.get_note_from_handle(note_handle)
+        except HandleError:
+            continue
+        note.remove_handle_references(class_name, [handle])
+        db_handle.commit_note(note, trans)
+
+
 def delete_person(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
     """Delete an person and its references."""
     try:
@@ -93,6 +116,7 @@ def delete_event(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
         family.remove_handle_references("Event", ev_handle_list)
         db_handle.commit_family(family, trans)
 
+    _remove_note_links(db_handle, "Event", handle, trans)
     db_handle.remove_event(handle, trans)
 
 
@@ -170,6 +194,7 @@ def delete_citation(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
         repo.remove_citation_references(ctn_handle_list)
         db_handle.commit_repository(repo, trans)
 
+    _remove_note_links(db_handle, "Citation", handle, trans)
     db_handle.remove_citation(citation.get_handle(), trans)
 
 
@@ -262,6 +287,7 @@ def delete_media(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
         citation.set_media_list(new_list)
         db_handle.commit_citation(citation, trans)
 
+    _remove_note_links(db_handle, "Media", handle, trans)
     db_handle.remove_media(handle, trans)
 
 
@@ -356,6 +382,7 @@ def delete_note(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
             repo.remove_note(note_handle)
             db_handle.commit_repository(repo, trans)
 
+    _remove_note_links(db_handle, "Note", note_handle, trans)
     db_handle.remove_note(note_handle, trans)
 
 
@@ -397,6 +424,7 @@ def delete_place(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
         event.remove_handle_references("Place", handle)
         db_handle.commit_event(event, trans)
 
+    _remove_note_links(db_handle, "Place", handle, trans)
     db_handle.remove_place(handle, trans)
 
 
@@ -416,6 +444,7 @@ def delete_repository(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None
         source.remove_repo_references(repos_handle_list)
         db_handle.commit_source(source, trans)
 
+    _remove_note_links(db_handle, "Repository", handle, trans)
     db_handle.remove_repository(handle, trans)
 
 
@@ -506,8 +535,10 @@ def delete_source(db_handle: DbWriteBase, handle: str, trans: DbTxn) -> None:
             db_handle.commit_repository(repo, trans)
 
     for citation_handle in citation_list:
+        _remove_note_links(db_handle, "Citation", citation_handle, trans)
         db_handle.remove_citation(citation_handle, trans)
 
+    _remove_note_links(db_handle, "Source", handle, trans)
     db_handle.remove_source(handle, trans)
 
 

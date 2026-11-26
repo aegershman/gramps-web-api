@@ -21,9 +21,29 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+from gramps.gen.db import DbTxn
+from gramps.gen.db.utils import make_database
 from gramps.gen.errors import HandleError
+from gramps.gen.lib import (
+    Citation,
+    Event,
+    Family,
+    Media,
+    Note,
+    Person,
+    Place,
+    Repository,
+    Source,
+    StyledText,
+    StyledTextTag,
+    StyledTextTagType,
+)
 
-from gramps_webapi.api.resources.delete import delete_family
+from gramps_webapi.api.resources.delete import (
+    delete_family,
+    delete_object_in_transaction,
+)
 
 
 class FakeDb:
@@ -56,3 +76,125 @@ def test_delete_family_skips_a_backlink_whose_object_is_gone():
     # the intact backlink is still cleaned up, and the family is gone
     db_handle.commit_note.assert_called_once()
     db_handle.remove_family.assert_called_once_with("f0001", trans)
+
+
+# A link in the text of a note is a reference to its target. Deleting the
+# target has to remove the link, and only the link.
+
+
+@pytest.fixture(scope="module")
+def db():
+    """An empty in-memory tree."""
+    database = make_database("sqlite")
+    database.load(":memory:")
+    yield database
+    database.close()
+
+
+def _add(db, obj) -> str:
+    with DbTxn("add", db) as trans:
+        db.method("add_%s", type(obj).__name__)(obj, trans)
+    return obj.handle
+
+
+def _link(class_name: str, handle: str, start: int, end: int) -> StyledTextTag:
+    return StyledTextTag(
+        StyledTextTagType.LINK, f"gramps://{class_name}/handle/{handle}", [(start, end)]
+    )
+
+
+def _linked_note(db, class_name: str, handle: str) -> str:
+    """Add a note that links to an object, with some other styling next to it."""
+    note = Note()
+    note.set_styledtext(
+        StyledText(
+            "See this record.",
+            [
+                StyledTextTag(StyledTextTagType.BOLD, True, [(0, 3)]),
+                _link(class_name, handle, 4, 15),
+            ],
+        )
+    )
+    return _add(db, note)
+
+
+def _delete(db, class_name: str, handle: str) -> None:
+    with DbTxn("delete", db) as trans:
+        delete_object_in_transaction(db, handle, class_name, trans)
+
+
+def _assert_link_removed(db, note_handle: str, target_handle: str) -> None:
+    note = db.get_note_from_handle(note_handle)
+    assert str(note.text) == "See this record."
+    assert [int(tag.name) for tag in note.text.get_tags()] == [StyledTextTagType.BOLD]
+    assert list(db.find_backlink_handles(target_handle)) == []
+
+
+@pytest.mark.parametrize(
+    "cls", [Person, Family, Event, Place, Source, Repository, Media, Note]
+)
+def test_delete_removes_note_links(db, cls):
+    target = _add(db, cls())
+    note = _linked_note(db, cls.__name__, target)
+    assert ("Note", note) in list(db.find_backlink_handles(target))
+
+    _delete(db, cls.__name__, target)
+
+    _assert_link_removed(db, note, target)
+
+
+def test_delete_citation_removes_note_links(db):
+    citation = Citation()
+    citation.set_reference_handle(_add(db, Source()))
+    target = _add(db, citation)
+    note = _linked_note(db, "Citation", target)
+
+    _delete(db, "Citation", target)
+
+    _assert_link_removed(db, note, target)
+
+
+def test_delete_source_removes_note_links_to_its_citations(db):
+    source = _add(db, Source())
+    citation = Citation()
+    citation.set_reference_handle(source)
+    citation_handle = _add(db, citation)
+    note_on_source = _linked_note(db, "Source", source)
+    note_on_citation = _linked_note(db, "Citation", citation_handle)
+
+    _delete(db, "Source", source)
+
+    # the citation goes with its source
+    assert not db.has_citation_handle(citation_handle)
+    _assert_link_removed(db, note_on_source, source)
+    _assert_link_removed(db, note_on_citation, citation_handle)
+
+
+def test_delete_keeps_note_links_to_other_objects(db):
+    kept = _add(db, Event())
+    gone = _add(db, Event())
+    note = Note()
+    note.set_styledtext(
+        StyledText(
+            "One and two.", [_link("Event", kept, 0, 3), _link("Event", gone, 8, 11)]
+        )
+    )
+    note_handle = _add(db, note)
+
+    _delete(db, "Event", gone)
+
+    tags = db.get_note_from_handle(note_handle).text.get_tags()
+    assert [tag.value for tag in tags] == [f"gramps://Event/handle/{kept}"]
+    assert list(db.find_backlink_handles(kept)) == [("Note", note_handle)]
+
+
+def test_delete_note_that_links_to_itself(db):
+    note = Note()
+    handle = _add(db, note)
+    note.set_styledtext(StyledText("Itself.", [_link("Note", handle, 0, 6)]))
+    with DbTxn("edit", db) as trans:
+        db.commit_note(note, trans)
+
+    _delete(db, "Note", handle)
+
+    assert not db.has_note_handle(handle)
